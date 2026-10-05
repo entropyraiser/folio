@@ -127,8 +127,9 @@
   .loss { color: var(--loss); }
 
   .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
-  .charts { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-  .lower { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .charts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-bottom: 12px; }
+  .charts.has-rates { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr); }
+  .lower { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .kpi, .card {
     background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px;
   }
@@ -326,7 +327,7 @@
     .side nav::-webkit-scrollbar { display: none; }
     .nav-btn { width: auto; flex: none; white-space: nowrap; }
     .kpis, .lower { grid-template-columns: 1fr 1fr; }
-    .charts { grid-template-columns: minmax(0, 1fr); }
+    .charts, .charts.has-rates { grid-template-columns: minmax(0, 1fr); }
     .topbar { flex-wrap: wrap; padding: 16px 16px 4px; }
     .content { padding: 12px 16px 24px; }
   }
@@ -727,7 +728,7 @@ function compute() {
     const value = price != null ? (h.qty || 0) * price : cost;
     const pnl = value - cost;
     const day = pr && pr.src === 'live' && pr.prev != null ? (h.qty || 0) * (price - pr.prev) : null;
-    return { ...h, cur, sym, price, src: pr ? pr.src : 'cost', cost, value, pnl,
+    return { ...h, cur, sym, price, src: pr ? pr.src : 'cost', cost, value, pnl, day,
       pnlPct: cost ? pnl / cost * 100 : null,
       valueBase: conv(value, cur), costBase: conv(cost, cur), pnlBase: conv(pnl, cur),
       dayBase: day != null ? conv(day, cur) : null };
@@ -948,17 +949,15 @@ function trendCard(c) {
 function ratesCard(c) {
   const srcName = { live: 'live', manual: 'fallback', last: 'last known', cost: 'default' };
   const srcTitle = { live: 'Live rate', manual: 'Your fallback rate', last: 'Last known rate', cost: 'Default rate. Set yours in Settings' };
-  const decFor = rate => rate >= 10 ? 2 : 3;
-  const rows = [{ code: 'INR', text: money(c.fx.rate, 'INR', 2), src: c.fx.src }];
-  for (const [code, meta] of Object.entries(FX_EXTRA)) {
+  const inr = (v, src) => ({ text: money(v, 'INR', 2), src });
+  const rows = [{ code: 'USD', ...inr(c.fx.rate, c.fx.src) }];
+  for (const code of Object.keys(FX_EXTRA)) {
     if (!c.hasExtra[code]) continue;
     const info = c.fx.extra[code];
-    const n = info.rate.toFixed(decFor(info.rate));
-    const text = meta.sign.includes(code) ? n : `${meta.sign}${n}`;
-    rows.push({ code, text, src: info.src });
+    rows.push({ code, ...inr(c.fx.rate / info.rate, info.src) });
   }
-  const list = rows.map(r => `<li><span><span class="code">${esc(r.code)}</span><span class="src" title="${esc(srcTitle[r.src] || '')}">${esc(srcName[r.src] || '')}</span></span><b class="num">${r.text}</b></li>`).join('');
-  return `<section class="card"><h3>Rates</h3><p class="kpi-sub">Per 1 US dollar</p><ul class="rates">${list}</ul></section>`;
+  const list = rows.map(r => `<li><span><span class="code">1 ${esc(r.code)}</span><span class="src" title="${esc(srcTitle[r.src] || '')}">${esc(srcName[r.src] || '')}</span></span><b class="num">${r.text}</b></li>`).join('');
+  return `<section class="card"><h3>Rates</h3><p class="kpi-sub">In rupees</p><ul class="rates">${list}</ul></section>`;
 }
 function trendHover(plot, clientX) {
   const n = trendPts.length;
@@ -1023,9 +1022,18 @@ function viewOverview(c) {
     <i class="sw" style="background:${p.color}"></i><span>${esc(p.short)}</span><b class="num">${shareOf(p.value, c.net)}%</b></button></li>`).join('')}</ul>`;
 
   const holds = [];
-  c.cats.us.items.forEach(h => holds.push({ name: h.symbol, value: h.valueBase }));
-  c.cats.in.items.forEach(h => holds.push({ name: h.symbol, value: h.valueBase }));
-  c.cats.other.items.forEach(h => holds.push({ name: h.label || h.sym || 'Asset', value: h.valueBase }));
+  for (const k of KEYS) {
+    for (const h of c.cats[k].items) {
+      if (!(h.valueBase > 0)) continue;
+      let name = h.symbol;
+      if (k === 'bcash') name = h.broker || 'Broker cash';
+      else if (k === 'bank') name = [h.bank, h.account].filter(Boolean).join(' · ') || 'Bank';
+      else if (k === 'hand') name = h.label || 'Cash';
+      else if (k === 'pf') name = h.label || 'PF';
+      else if (k === 'other') name = h.label || h.sym || 'Asset';
+      holds.push({ name, value: h.valueBase });
+    }
+  }
   holds.sort((a, b) => b.value - a.value);
   const topHolds = holds.slice(0, 5).map(h => ({ ...h, label: money(h.value, c.base) }));
 
@@ -1039,25 +1047,16 @@ function viewOverview(c) {
   c.cats.other.items.forEach(h => add(h.label, h.valueBase));
   const inst = Object.entries(g).map(([n, t]) => ({ name: n, value: t, label: money(t, c.base) })).filter(i => i.value !== 0).sort((a, b) => b.value - a.value).slice(0, 5);
 
-  const movers = [];
-  ['us', 'in', 'other'].forEach(k => c.cats[k].items.forEach(h => {
-    if (h.dayBase != null && h.dayBase !== 0) movers.push({ name: h.symbol || h.label, day: h.dayBase });
-  }));
-  movers.sort((a, b) => Math.abs(b.day) - Math.abs(a.day));
-  const activity = movers.length
-    ? `<ul class="activity">${movers.slice(0, 5).map(m => `<li><span><i class="dotc" style="background:${m.day >= 0 ? 'var(--gain)' : 'var(--loss)'}"></i>${esc(m.name)}</span><span class="${cls(m.day)} num">${Sg(m.day, c.base)}</span><span class="when">today</span></li>`).join('')}</ul>`
-    : '<p class="empty">No live moves yet. Prices show up here after a refresh.</p>';
-
+  const rates = ratesCard(c);
   return `${kpis}
-    <div class="charts">
+    <div class="charts${rates ? ' has-rates' : ''}">
       ${trendCard(c)}
       <section class="card"><h3>Mix</h3><div class="mix">${mix}${legend}</div></section>
-      ${ratesCard(c)}
+      ${rates}
     </div>
     <div class="lower">
       <section class="card"><h3>Largest holdings</h3>${progressList(topHolds)}</section>
       <section class="card"><h3>By institution</h3>${progressList(inst)}</section>
-      <section class="card"><h3>Today</h3>${activity}</section>
     </div>`;
 }
 
@@ -1113,8 +1112,8 @@ function viewStocks(kind, c) {
   const x = c.cats[kind];
   const cur = kind === 'us' ? 'USD' : 'INR';
   const groups = groupBy(x.items, 'broker');
-  const stockCols = [{ h: 'Symbol' }, { h: 'Qty', r: 1, sm: 1, w: '8%' }, { h: 'Price', r: 1, sm: 1, w: '12%' }, { h: 'Avg', r: 1, sm: 1, w: '12%' },
-    { h: 'Value', r: 1, w: '14%' }, { h: 'P&L', r: 1, w: '13%' }, { h: 'P&L %', r: 1, sm: 1, w: '9%' }, { h: '' }];
+  const stockCols = [{ h: 'Symbol' }, { h: 'Qty', r: 1, sm: 1, w: '8%' }, { h: 'Price', r: 1, sm: 1, w: '11%' }, { h: 'Avg', r: 1, sm: 1, w: '11%' },
+    { h: 'Value', r: 1, w: '13%' }, { h: 'P&L', r: 1, w: '13%' }, { h: 'P&L %', r: 1, sm: 1, w: '8%' }, { h: 'Today', r: 1, w: '13%' }, { h: '' }];
   const blocks = groups.map(([name, items]) => {
     const sub = items.reduce((a, h) => a + h.valueBase, 0);
     const rows = items.map(h => {
@@ -1130,6 +1129,7 @@ function viewStocks(kind, c) {
         <td class="r" data-v="${h.value || 0}">${M(h.value, cur)}</td>
         <td class="r ${cls(h.pnl)}" data-v="${h.pnl || 0}">${Sg(h.pnl, cur)}${h.pnlPct != null ? `<small class="only-sm num">${pct(h.pnlPct)}</small>` : ''}</td>
         <td class="r hide-sm ${cls(h.pnl)}" data-v="${h.pnlPct ?? ''}"><span class="num">${h.pnlPct != null ? pct(h.pnlPct) : '—'}</span></td>
+        <td class="r ${h.day == null ? '' : cls(h.day)}" data-v="${h.day ?? ''}">${h.day == null ? '—' : Sg(h.day, cur)}</td>
         ${acts(kind, h.id)}</tr>`;
     });
     return `<div class="ghead"><h3>${esc(name)}</h3><span class="tot">${M(sub, c.base)}</span></div>
@@ -1302,7 +1302,7 @@ function render() {
   const nextMode = mode === 'dark' ? 'light' : 'dark';
   const fxLine = `1 USD = ₹${c.fx.rate.toFixed(2)}`;
   const crumb = tab === 'settings' ? 'Theme, rates, and backups'
-    : tab === 'overview' ? fxLine
+    : tab === 'overview' ? ''
     : `Net worth ${money(c.net, c.base)} · ${fxLine}`;
   const nav = NAV.map(([label, items]) => `<p class="side-label">${label}</p>` + items.map(([k, n]) =>
     `<button class="nav-btn" data-act="tab" data-tab="${k}"${tab === k ? ' aria-current="page"' : ''}>${ICO[k] || ''}<span>${n}</span></button>`).join('')).join('');
@@ -1314,7 +1314,7 @@ function render() {
     </aside>
     <div class="maincol">
       <header class="topbar">
-        <div><h1>${PAGE[tab] || 'Overview'}</h1><p class="crumb${tab === 'settings' ? '' : ' num'}">${esc(crumb)}</p></div>
+        <div><h1>${PAGE[tab] || 'Overview'}</h1>${crumb ? `<p class="crumb${tab === 'settings' ? '' : ' num'}">${esc(crumb)}</p>` : ''}</div>
         <div class="tools">
           ${tab === 'overview' || tab === 'settings' ? '' : `<label class="search">${SEARCH}<input id="q" type="search" placeholder="Search..." value="${esc(query)}" aria-label="Search holdings"></label>`}
           ${statusBar()}
