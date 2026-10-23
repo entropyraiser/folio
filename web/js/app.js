@@ -53,7 +53,7 @@ function applyTheme() {
 
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
-  if (!remote.on) return;
+  if (!remote.on || remote.orphan) return;   // an empty server waiting on the choice in the notice
   if (!remote.sending && !remote.dirty && JSON.stringify(dataForServer()) === remote.body) return;   // only the price cache changed
   remote.dirty = true;
   remote.state = 'saving';
@@ -120,8 +120,8 @@ async function syncFromServer() {
       try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
       remote.body = JSON.stringify(dataForServer());
       remote.state = 'saved';
-    } else if (KEYS_COUNT() > 0) {                  // first run with the file: move browser data into it
-      remote.state = 'saving'; pushRemote();
+    } else if (KEYS_COUNT() > 0) {                  // empty server, but this browser remembers holdings: ask before moving them in
+      remote.orphan = true; remote.state = 'saved';
     } else remote.state = 'saved';
   } catch (e) { remote.on = false; remote.state = 'off'; }
 }
@@ -746,6 +746,12 @@ document.addEventListener('click', e => {
       break;
     }
     case 'import': $('#file').click(); break;
+    case 'orphan-keep': remote.orphan = false; remote.dirty = true; remote.state = 'saving'; pushRemote(); render(); break;
+    case 'orphan-blank':
+      if (confirm('Start with nothing? The holdings this browser remembers will be erased here.')) {
+        const backend = S.settings.backend; S = defaults(); S.settings.backend = backend; remote.orphan = false; save(); render();
+      }
+      break;
     case 'backup-dl': downloadBackup(); break;
     case 'backup-up': $('#dbfile').click(); break;
     case 'reset':

@@ -35,10 +35,10 @@ st.splits_note('AAPL', (today - datetime.timedelta(days=3)).isoformat(), 4.0)
   if (r.status !== 0) throw new Error('seed failed: ' + r.stderr);
 }
 
-async function startServer() {
+async function startServer(opts = {}) {
   const port = 8800 + Math.floor(Math.random() * 90);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'folio-e2e-'));
-  seed(dir);
+  if (!opts.empty) seed(dir);
   const proc = spawn('python3', [path.join(ROOT, 'server.py')], { env: { ...process.env, PORT: String(port), DB_FILE: path.join(dir, 'folio.db'), LOG_DIR: path.join(dir, 'logs') }, stdio: 'ignore' });
   for (let i = 0; i < 50; i++) { try { if ((await fetch(`http://localhost:${port}/api/health`)).ok) break; } catch (e) {} await sleep(200); }
   return { port, dir, url: `http://localhost:${port}/`, stop() { proc.kill(); fs.rmSync(dir, { recursive: true, force: true }); } };

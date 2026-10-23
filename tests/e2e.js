@@ -215,6 +215,23 @@ const step = async (name, fn) => { try { await fn(); results.push(['ok', name]);
       await shot('overview-dark');
     });
 
+    await step('a new empty server asks before adopting holdings the browser remembers', async () => {
+      const fresh = await startServer({ empty: true });
+      try {
+        const furl = fresh.url, get = async () => (await (await fetch(`http://localhost:${fresh.port}/api/data`)).json());
+        await b.goto(furl);
+        await b.eval(`localStorage.setItem('networth.v1', JSON.stringify({ us: [{ id: 'x1', broker: 'Etrade', symbol: 'AAPL', qty: 3, avg: 100 }], settings: { base: 'USD' } }))`);
+        await b.goto(furl);
+        await wait(`document.querySelector('[data-act=orphan-keep]')`);
+        await sleep(1000);
+        assert.equal((await get()).exists, false, 'nothing is copied into the server unasked');
+        await b.click('[data-act=orphan-keep]');
+        for (let i = 0; i < 30 && !(await get()).exists; i++) await sleep(150);
+        assert.equal((await get()).data.us[0].symbol, 'AAPL');
+        assert.equal(await b.eval(`!!document.querySelector('[data-act=orphan-keep]')`), false);
+      } finally { fresh.stop(); }
+    });
+
     assert.deepEqual(b.errors, [], 'no console errors');
   } finally {
     if (b) await b.close();

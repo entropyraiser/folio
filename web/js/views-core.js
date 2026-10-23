@@ -145,6 +145,11 @@ function splitHoldings(X, s) {
 }
 function alerts(X, c) {
   const out = [];
+  if (X.remote.orphan) out.push(`<div class="alert warn" role="alert">${icon('database', 17)}<div class="alert-body"><b>This tracker has no saved data yet, but this browser remembers holdings</b>
+      <div class="detail">They are from an earlier install. Keep them to save them into this tracker (daily history starts again), restore a full backup file to get everything back, or start blank.</div></div>
+      <div class="alert-act"><button class="btn sm" data-act="orphan-keep">Keep these holdings</button>
+      <button class="btn secondary sm" data-act="backup-up">Restore a backup…</button>
+      <button class="btn secondary sm" data-act="orphan-blank">Start blank</button></div></div>`);
   for (const s of X.splits) {
     const hs = splitHoldings(X, s);
     if (!hs.length) continue;
