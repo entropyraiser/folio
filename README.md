@@ -28,6 +28,7 @@ If a day was valued with an estimated price, or you fixed a wrong quantity, valu
 Everything is in `folio.db` next to `server.py` (change with `DB_FILE=/path/folio.db`): holdings, every saved version of them (last 30), the daily history, the last good prices and pending splits. A browser that is behind another save is asked to reload instead of overwriting it.
 
 - **Backups**: the first write each day copies the database to `data-backups/folio-YYYY-MM-DD.db` (last 30 kept). The server opens the newest one at every start and logs whether it is readable.
+- **Move to another machine**: in Settings → Your data, **Download full backup** saves one `.db` file with everything above, and **Restore from backup…** on the other machine's dashboard loads it (it shows what is in the file first, and keeps what you had as a backup). If encryption is on, also keep the recovery key.
 - **Check and restore** (`python3 folio.py --help` lists everything):
   - `python3 folio.py status` shows what is stored.
   - `python3 folio.py verify` opens every backup, decrypts it and checks it, so you know a restore would work.

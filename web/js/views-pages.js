@@ -127,8 +127,9 @@ function settings(X, c) {
       </section>
       <section class="card" id="set-data" style="margin-bottom:var(--gap)"><div class="card-h"><h3>Your data</h3></div>
         <div class="card-b">${safety}
-          <p class="s-d" style="margin-top:12px">Check backups with <code>python3 folio.py verify</code>. Restore with <code>python3 folio.py restore FILE</code> after stopping the server. Turn on encryption with <code>python3 folio.py encrypt</code>.</p>
-          <div class="row" style="margin-top:14px"><button class="btn secondary" data-act="export">${icon('download', 15)}Export backup</button><button class="btn secondary" data-act="import">${icon('upload', 15)}Import backup</button>
+          ${remote.on ? `<p class="s-d" style="margin-top:12px"><b>Full backup</b> is one file with your holdings, every saved version and the whole daily history. Keep it somewhere safe, then restore it here on any machine running this tracker. ${st && st.encrypted ? 'Encryption is on, so the file can only be opened with your recovery key too.' : 'It is not encrypted, so treat the file like your statements.'}</p>
+          <div class="row" style="margin-top:14px"><button class="btn" data-act="backup-dl">${icon('download', 15)}Download full backup</button><button class="btn secondary" data-act="backup-up">${icon('upload', 15)}Restore from backup…</button></div>
+          <div class="row" style="margin-top:10px">` : `<div class="row" style="margin-top:14px"><button class="btn secondary" data-act="export">${icon('download', 15)}Export backup</button><button class="btn secondary" data-act="import">${icon('upload', 15)}Import backup</button>`}
           <button class="btn secondary" data-act="import-csv" data-k="us">${icon('upload', 15)}Import holdings from CSV</button><button class="btn secondary danger" data-act="reset">${icon('trash-2', 15)}Erase all data</button></div></div>
       </section>
       <section class="card" id="set-history" style="margin-bottom:var(--gap)"><div class="card-h"><h3>Daily history</h3></div>

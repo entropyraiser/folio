@@ -637,6 +637,29 @@ function sample() {
   S.other.push({ id: uid(), label: 'Sample Bitcoin', currency: 'USD', symbol: 'BTC-USD', qty: 0.05, price: null, priceAt: 0, value: null });
   save(); loadQuotes();
 }
+async function downloadBackup() {
+  try {
+    const r = await fetch(apiBase() + '/api/backup');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob());
+    a.download = `folio-backup-${isoDay(new Date())}.db`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    toast('Backup downloaded');
+  } catch (e) { alert('Could not make a backup: ' + e.message); }
+}
+async function restoreBackup(file) {
+  const post = q => fetch(apiBase() + '/api/restore' + q, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+  try {
+    const r = await post('?dry=1'), d = await r.json();
+    if (!r.ok) return alert('That file cannot be restored: ' + (d.error || (d.problems || []).join('; ') || 'unreadable'));
+    if (!confirm(`Replace everything with this backup?\n\n${d.holdings} holdings and ${d.history_days} days of history.\n\nWhat you have now is kept as a backup file first.`)) return;
+    const r2 = await post(''), d2 = await r2.json();
+    if (!r2.ok) return alert('Restore failed: ' + (d2.error || (d2.problems || []).join('; ')));
+    location.reload();
+  } catch (e) { alert('Restore failed: ' + e.message); }
+}
 function download(name, text) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
@@ -723,6 +746,8 @@ document.addEventListener('click', e => {
       break;
     }
     case 'import': $('#file').click(); break;
+    case 'backup-dl': downloadBackup(); break;
+    case 'backup-up': $('#dbfile').click(); break;
     case 'reset':
       if (confirm('Erase all holdings and settings from this browser? Export a backup first if unsure.')) {
         try { localStorage.removeItem(KEY); } catch (err) {}
@@ -811,6 +836,10 @@ $('#csvfile').addEventListener('change', e => {
   const r = new FileReader();
   r.onload = () => { openCsv(String(r.result), csvTarget); e.target.value = ''; };
   r.readAsText(f);
+});
+$('#dbfile').addEventListener('change', e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (f) restoreBackup(f);
 });
 $('#file').addEventListener('change', e => {
   const f = e.target.files[0]; if (!f) return;

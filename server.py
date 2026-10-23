@@ -28,6 +28,7 @@ import mimetypes
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,7 @@ HISTORY_FILE = os.environ.get("HISTORY_FILE", os.path.join(_data_dir, "history.j
 LOG_DIR = os.environ.get("LOG_DIR", os.path.join(HERE, "logs"))
 LOG_FILE = os.path.join(LOG_DIR, "server.log")
 MAX_BODY = 5 * 1024 * 1024
+MAX_RESTORE = 256 * 1024 * 1024   # a whole database file
 
 _log = logging.getLogger("folio")
 STORE = None
@@ -207,8 +209,48 @@ class Handler(BaseHTTPRequestHandler):
             HISTORY.kick()
         self._json(200, {"ok": True, "rev": rev}, cors=False)
 
+    def _restore(self, dry):
+        """Take an uploaded backup database. dry=True only reports what is in it."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_RESTORE:
+            return self._json(413, {"error": "backup file missing or too large"}, cors=False)
+        blob = self.rfile.read(length)
+        if not blob.startswith(b"SQLite format 3\x00"):
+            return self._json(400, {"error": "That is not a backup file from this tracker."}, cors=False)
+        os.makedirs(STORE.backup_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="upload-", suffix=".db", dir=STORE.backup_dir)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(blob)
+            report = verify_db(tmp, STORE._key_given)
+            summary = {k: report[k] for k in ("ok", "problems", "holdings", "history_days", "encrypted")}
+            if not report["ok"] or dry:
+                return self._json(200 if report["ok"] else 400, summary, cors=False)
+            try:
+                res = STORE.restore_from(tmp)
+            except (StoreError, OSError) as exc:
+                return self._json(500, {"error": f"could not restore: {exc}"}, cors=False)
+            log_line(f"restored from an uploaded backup ({summary['holdings']} holdings, {summary['history_days']} days); previous state kept as {res['kept']}")
+            if HISTORY:
+                HISTORY.kick()
+            self._json(200, {**summary, "restored": True, "kept": os.path.basename(res["kept"])}, cors=False)
+        finally:
+            for extra in ("", "-wal", "-shm", "-journal"):
+                try:
+                    os.remove(tmp + extra)
+                except FileNotFoundError:
+                    pass
+
     def do_POST(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/restore":
+            if not self._private():
+                return
+            return self._restore("dry" in parse_qs(parsed.query))
         if path not in ("/api/history/rebuild", "/api/splits"):
             return self._json(404, {"error": "not found"})
         if not self._private():
@@ -254,6 +296,35 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError, StoreError) as exc:
                 return self._json(500, {"error": f"could not read data: {exc}"}, cors=False)
             return self._json(200, {"exists": data is not None, "data": data, "rev": rev}, cors=False)
+
+        if path == "/api/backup":
+            if not self._private():
+                return
+            os.makedirs(STORE.backup_dir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="export-", suffix=".db", dir=STORE.backup_dir)
+            os.close(fd)
+            try:
+                STORE.backup_to(tmp)
+                with open(tmp, "rb") as f:
+                    blob = f.read()
+            except (OSError, StoreError) as exc:
+                return self._json(500, {"error": f"could not make a backup: {exc}"}, cors=False)
+            finally:
+                for extra in ("", "-wal", "-shm", "-journal", ".tmp"):
+                    try:
+                        os.remove(tmp + extra)
+                    except FileNotFoundError:
+                        pass
+            name = f"folio-backup-{datetime.date.today().isoformat()}.db"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(blob)
+            return
 
         if path == "/api/history":
             if not self._private():

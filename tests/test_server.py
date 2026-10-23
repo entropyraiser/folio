@@ -16,7 +16,7 @@ from quotes import Quotes
 from store import Store
 
 
-class ServerTests(unittest.TestCase):
+class ServerBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tmpdir()
@@ -39,8 +39,8 @@ class ServerTests(unittest.TestCase):
     def req(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         h = {"Host": f"localhost:{self.port}", **(headers or {})}
-        data = json.dumps(body) if body is not None else None
-        if data:
+        data = body if isinstance(body, bytes) else json.dumps(body) if body is not None else None
+        if data and not isinstance(body, bytes):
             h.setdefault("Content-Type", "application/json")
         conn.request(method, path, data, h)
         resp = conn.getresponse()
@@ -51,6 +51,8 @@ class ServerTests(unittest.TestCase):
         except ValueError:
             return resp.status, raw, resp
 
+
+class ServerTests(ServerBase):
     # ---- holdings: the privacy rules ----
     def test_private_routes_refuse_foreign_hosts_and_origins(self):
         for path in ("/api/data", "/api/history", "/api/attribution", "/api/history/health", "/api/status", "/api/splits"):
@@ -119,6 +121,31 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/quotes?symbols=")[0], 400)
         self.assertEqual(self.req("GET", "/api/quotes?symbols=a%20b;rm")[0], 400)
 
+class BackupTests(ServerBase):   # its own server, so revisions start from zero
+    def test_backup_downloads_and_restores_everything(self):
+        self.req("PUT", "/api/data", sample_portfolio(), {"If-Match": "0"})
+        status, blob, resp = self.req("GET", "/api/backup")
+        self.assertEqual(status, 200)
+        self.assertTrue(blob.startswith(b"SQLite format 3"))
+        self.assertIn("attachment", resp.getheader("Content-Disposition"))
+        # change the data, then bring the backup back
+        changed = sample_portfolio(); changed["us"] = []
+        self.req("PUT", "/api/data", changed, {"If-Match": "1"})
+        status, rep, _ = self.req("POST", "/api/restore?dry=1", blob)
+        self.assertEqual((status, rep["ok"], rep["holdings"] > 0), (200, True, True))
+        self.assertEqual(self.req("GET", "/api/data")[1]["data"]["us"], [])      # a dry run changes nothing
+        status, rep, _ = self.req("POST", "/api/restore", blob)
+        self.assertEqual((status, rep.get("restored")), (200, True))
+        body = self.req("GET", "/api/data")[1]
+        self.assertEqual(body["data"]["us"][0]["symbol"], "AAPL")
+        self.assertGreater(body["rev"], 2)                                       # open browsers reload instead of overwriting
+
+    def test_restore_refuses_junk_and_foreign_callers(self):
+        self.assertEqual(self.req("POST", "/api/restore", b"not a database")[0], 400)
+        self.assertEqual(self.req("POST", "/api/restore", b"")[0], 413)
+        for method, path, body in (("GET", "/api/backup", None), ("POST", "/api/restore", b"x")):
+            self.assertEqual(self.req(method, path, body, {"Origin": "http://evil.example"})[0], 403)
+            self.assertEqual(self.req(method, path, body, {"Host": "evil.example"})[0], 403)
 
 if __name__ == "__main__":
     unittest.main()
