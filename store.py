@@ -203,6 +203,32 @@ class Store:
                 pass
         os.replace(tmp, dest)
 
+    def export_to(self, dest, secrets=None):
+        """A backup for moving machines: the database plus small secrets that live
+        outside it (such as the price-source key), packed like the rest of the data."""
+        self.backup_to(dest)
+        secrets = {k: v for k, v in (secrets or {}).items() if v}
+        if secrets:
+            out = sqlite3.connect(dest)
+            try:
+                out.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('secrets', ?)", (self._pack(secrets),))
+                out.commit()
+            finally:
+                out.close()
+
+    def take_secrets(self):
+        """Read the secrets that came in with a restored backup, and remove them from the database."""
+        db = self._db()
+        row = db.execute("SELECT v FROM meta WHERE k='secrets'").fetchone()
+        if not row:
+            return {}
+        db.execute("DELETE FROM meta WHERE k='secrets'")
+        try:
+            got = self._unpack(row[0])
+        except (ValueError, StoreError, crypto.CryptoError):
+            return {}
+        return got if isinstance(got, dict) else {}
+
     # ---------- portfolio ----------
     def read_portfolio(self):
         """(portfolio, rev); (None, 0) before the first save."""

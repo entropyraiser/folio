@@ -140,6 +140,16 @@ class BackupTests(ServerBase):   # its own server, so revisions start from zero
         self.assertEqual(body["data"]["us"][0]["symbol"], "AAPL")
         self.assertGreater(body["rev"], 2)                                       # open browsers reload instead of overwriting
 
+    def test_price_key_kept_in_a_file_travels_with_the_backup(self):
+        self.req("PUT", "/api/data", sample_portfolio(), {"If-Match": "0"})
+        with mock.patch.object(server, "_alpha_key_from_file", return_value="ABCDEFGH12345678"):
+            blob = self.req("GET", "/api/backup")[1]
+        self.assertNotIn(b"ABCDEFGH12345678", blob) if server.STORE.encrypted() else None
+        with mock.patch.object(server, "_alpha_key_from_file", return_value=""):   # the new machine has no key file
+            self.assertEqual(self.req("POST", "/api/restore", blob)[0], 200)
+            self.assertEqual(self.req("GET", "/api/data")[1]["data"]["settings"]["alphaKey"], "ABCDEFGH12345678")
+        self.assertIsNone(server.STORE.meta("secrets"))                              # not left behind in the database
+
     def test_restore_refuses_junk_and_foreign_callers(self):
         self.assertEqual(self.req("POST", "/api/restore", b"not a database")[0], 400)
         self.assertEqual(self.req("POST", "/api/restore", b"")[0], 413)

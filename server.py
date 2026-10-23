@@ -57,6 +57,7 @@ HISTORY_FILE = os.environ.get("HISTORY_FILE", os.path.join(_data_dir, "history.j
 LOG_DIR = os.environ.get("LOG_DIR", os.path.join(HERE, "logs"))
 LOG_FILE = os.path.join(LOG_DIR, "server.log")
 MAX_BODY = 5 * 1024 * 1024
+ALPHA_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
 MAX_RESTORE = 256 * 1024 * 1024   # a whole database file
 
 _log = logging.getLogger("folio")
@@ -233,6 +234,13 @@ class Handler(BaseHTTPRequestHandler):
                 res = STORE.restore_from(tmp)
             except (StoreError, OSError) as exc:
                 return self._json(500, {"error": f"could not restore: {exc}"}, cors=False)
+            # a price-source key that was only in a file on the old machine moves into the settings here
+            alpha = (STORE.take_secrets().get("alphaKey") or "").strip()
+            if alpha and ALPHA_RE.match(alpha):
+                pf, rev = STORE.read_portfolio()
+                if pf is not None and not str((pf.get("settings") or {}).get("alphaKey") or "").strip() and not _alpha_key_from_file():
+                    pf.setdefault("settings", {})["alphaKey"] = alpha
+                    STORE.write_portfolio(pf, rev)
             log_line(f"restored from an uploaded backup ({summary['holdings']} holdings, {summary['history_days']} days); previous state kept as {res['kept']}")
             if HISTORY:
                 HISTORY.kick()
@@ -304,7 +312,7 @@ class Handler(BaseHTTPRequestHandler):
             fd, tmp = tempfile.mkstemp(prefix="export-", suffix=".db", dir=STORE.backup_dir)
             os.close(fd)
             try:
-                STORE.backup_to(tmp)
+                STORE.export_to(tmp, {"alphaKey": _alpha_key_from_file()})
                 with open(tmp, "rb") as f:
                     blob = f.read()
             except (OSError, StoreError) as exc:
