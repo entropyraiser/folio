@@ -9,3 +9,8 @@ logs/
 .DS_Store
 *.tmp
 __pycache__/
+folio.db
+folio.db-wal
+folio.db-shm
+folio.db.tmp
+alpha_vantage_api_key.txt

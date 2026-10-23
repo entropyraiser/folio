@@ -1,86 +1,66 @@
 #!/usr/bin/env python3
 """
-Net worth tracker: price server.
+Net worth tracker: server.
 
-Fetches live quotes from Yahoo Finance, serves the dashboard (index.html),
-stores your holdings in data.json next to this file, and records your net
-worth once a day in history.jsonl.
+Serves the dashboard (web/), fetches live quotes (Yahoo Finance, with
+fallbacks), stores your holdings and a daily net worth record in folio.db next
+to this file, and keeps backups of it.
 No third-party packages needed. Python 3.8+.
 
 Run:   python3 server.py
 Open:  http://localhost:8787
 
+Maintenance (backup, restore, verify, encrypt, rebuild history): python3 folio.py --help
+
 Options (environment variables):
   PORT=8787        port to listen on
   HOST=127.0.0.1   interface to bind (keep the default unless you know why)
-  DATA_FILE=...    where holdings are stored (default: data.json next to server.py)
-  HISTORY_FILE=... daily net worth records (default: history.jsonl next to DATA_FILE)
+  DB_FILE=...      the database (default: folio.db next to server.py)
+  DATA_FILE=...    older data.json to import on first start (default: data.json next to DB_FILE)
+  HISTORY_FILE=... older history.jsonl to import on first start
   LOG_DIR=...      where server.log is written (default: logs/ next to server.py)
 """
+import datetime
 import ipaddress
 import json
-import datetime
 import logging
+import mimetypes
 import os
 import re
-import shutil
-import socket
 import sys
 import threading
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlparse
 
+import history as history_mod
+import quotes as quotes_mod
 from history import History
+from quotes import Quotes
+from store import DAILY_BACKUP_RE, RevConflict, StoreError, open_default, validate_portfolio, verify_db
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(HERE, "web")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8787"))
 
-YAHOO_HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9.^=&_\-]{1,24}$")
-CACHE_TTL = 20  # seconds; stops rapid refreshes from hammering Yahoo
-ERROR_TTL = 15  # seconds; a failed symbol is not fetched again on every refresh
-QUOTE_DEADLINE = 16  # seconds for the whole batch; the page stops waiting at 20
-HOST_TIMEOUT = 4  # a healthy answer takes well under a second
-HOST_COOLDOWN = 30  # seconds a host that timed out or was unreachable is skipped
-SLOW_BATCH = 5  # seconds; a batch slower than this is logged even when it succeeds
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MAX_SYMBOLS = 100
-LIST_KEYS = ("us", "in", "bcash", "bank", "hand", "pf", "other")
-DAILY_BACKUP_RE = re.compile(r"^data-\d{4}-\d{2}-\d{2}\.json$")
-VERSION_BACKUP_RE = re.compile(r"^data-v-\d{8}T\d{6}(?:-\d+)?\.json$")
 
-DATA_FILE = os.environ.get("DATA_FILE", os.path.join(HERE, "data.json"))
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), "data-backups")
-HISTORY_FILE = os.environ.get("HISTORY_FILE", os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), "history.jsonl"))
+DB_FILE = os.environ.get("DB_FILE", os.path.join(HERE, "folio.db"))
+_data_dir = os.path.dirname(os.path.abspath(DB_FILE))
+DATA_FILE = os.environ.get("DATA_FILE", os.path.join(_data_dir, "data.json"))
+HISTORY_FILE = os.environ.get("HISTORY_FILE", os.path.join(_data_dir, "history.jsonl"))
 LOG_DIR = os.environ.get("LOG_DIR", os.path.join(HERE, "logs"))
 LOG_FILE = os.path.join(LOG_DIR, "server.log")
 MAX_BODY = 5 * 1024 * 1024
-KEEP_BACKUPS = 30
 
-_cache = {}
-_cache_lock = threading.Lock()
-_data_lock = threading.Lock()
-_host_down_until = {}
-_host_lock = threading.Lock()
-_batch_lock = threading.Lock()
-_batch_state = {"failing": False, "symbol_errors": {}}
 _log = logging.getLogger("folio")
+STORE = None
+QUOTES = None
 HISTORY = None
-
-
-class RevConflict(Exception):
-    def __init__(self, rev):
-        self.rev = rev
 
 
 def setup_logging():
@@ -106,247 +86,22 @@ def log_line(msg):
     _log.info(msg)
 
 
-def _unwrap(stored):
-    """Return (portfolio, rev). Older files are the portfolio itself, at rev 1."""
-    if (
-        isinstance(stored, dict)
-        and isinstance(stored.get("rev"), int)
-        and isinstance(stored.get("portfolio"), dict)
-    ):
-        return stored["portfolio"], stored["rev"]
-    return stored, 1
-
-
 def read_stored():
-    """Return (portfolio, rev). portfolio is None when the file does not exist yet.
-    A corrupt file raises, so the dashboard never overwrites it by mistake."""
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            stored = json.load(f)
-    except FileNotFoundError:
-        return None, 0
-    if not isinstance(stored, dict):
-        raise ValueError("data file is not a JSON object")
-    return _unwrap(stored)
-
-
-def validate_portfolio(obj):
-    if not isinstance(obj, dict):
-        raise ValueError("expected a JSON object")
-    if not isinstance(obj.get("settings"), dict):
-        raise ValueError("expected a settings object")
-    for key in LIST_KEYS:
-        if key in obj and not isinstance(obj[key], list):
-            raise ValueError(f"expected {key} to be a list")
-
-
-def _prune(names, pattern):
-    matched = sorted(name for name in names if pattern.match(name))
-    for old in matched[:-KEEP_BACKUPS]:
-        try:
-            os.remove(os.path.join(BACKUP_DIR, old))
-        except OSError:
-            pass
-
-
-def _backup_current():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    day = os.path.join(BACKUP_DIR, f"data-{datetime.date.today().isoformat()}.json")
-    if not os.path.exists(day):
-        shutil.copy2(DATA_FILE, day)
-    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    version = os.path.join(BACKUP_DIR, f"data-v-{stamp}.json")
-    n = 2
-    while os.path.exists(version):
-        version = os.path.join(BACKUP_DIR, f"data-v-{stamp}-{n}.json")
-        n += 1
-    shutil.copy2(DATA_FILE, version)
-    names = os.listdir(BACKUP_DIR)
-    _prune(names, DAILY_BACKUP_RE)
-    _prune(names, VERSION_BACKUP_RE)
+    """(portfolio, rev). portfolio is None before the first save."""
+    return STORE.read_portfolio()
 
 
 def write_data(obj, expected_rev):
-    """Replace the file only when expected_rev is the rev currently on disk.
-    Returns the new rev. Raises RevConflict when another save landed first."""
-    validate_portfolio(obj)
-    with _data_lock:
-        current, rev = read_stored()
-        if expected_rev != rev:
-            raise RevConflict(rev)
-        if current is not None:
-            _backup_current()
-        tmp = DATA_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"rev": rev + 1, "portfolio": obj}, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, DATA_FILE)  # atomic: never leaves a half-written file
-        return rev + 1
+    return STORE.write_portfolio(obj, expected_rev)
 
 
-def _cache_get(sym):
-    with _cache_lock:
-        hit = _cache.get(sym)
-        if hit and time.monotonic() - hit[0] < hit[2]:
-            return hit[1]
-    return None
-
-
-def _cache_put(sym, payload, ttl):
-    with _cache_lock:
-        _cache[sym] = (time.monotonic(), payload, ttl)
-
-
-def _host_ok(host):
-    with _host_lock:
-        return time.monotonic() >= _host_down_until.get(host, 0)
-
-
-def _host_failed(host):
-    """Skip this host for a while, so one that hangs (for example just after
-    the Mac wakes, before the network is back) cannot use up a whole batch."""
-    with _host_lock:
-        _host_down_until[host] = time.monotonic() + HOST_COOLDOWN
-
-
-def _short(exc):
-    return str(exc).split("\n", 1)[0][:200]
-
-
-def _chart_error(exc):
-    try:
-        return ((json.loads(exc.read()).get("chart") or {}).get("error") or {}).get("description") or ""
-    except Exception:
-        return ""
-
-
-def yahoo_chart(sym, query, deadline):
-    """Fetch one chart from the first healthy Yahoo host that answers.
-    Returns (result, None) or (None, (kind, message)), where kind is:
-      symbol    Yahoo has no data for this symbol; retrying will not help
-      http      Yahoo answered with an error status (rate limit, outage)
-      timeout   a host did not answer within HOST_TIMEOUT
-      network   a host could not be reached (DNS, refused, reset)
-      offline   every host failed within HOST_COOLDOWN, so none was tried
-      deadline  the batch ran out of time before this symbol was tried"""
-    err = None
-    for host in YAHOO_HOSTS:
-        if not _host_ok(host):
-            continue
-        remaining = deadline - time.monotonic()
-        if remaining < 0.5:
-            return None, err or ("deadline", "not tried before the batch deadline")
-        url = f"https://{host}/v8/finance/chart/{quote(sym)}?{query}"
-        try:
-            req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-            with urlopen(req, timeout=min(HOST_TIMEOUT, remaining)) as resp:
-                data = json.load(resp)
-        except HTTPError as exc:
-            desc = _chart_error(exc)
-            if exc.code == 404:
-                return None, ("symbol", desc or "symbol not found")
-            err = ("http", f"HTTP {exc.code} from {host}" + (f": {desc}" if desc else ""))
-            continue
-        except URLError as exc:
-            _host_failed(host)
-            if isinstance(exc.reason, socket.timeout):
-                err = ("timeout", f"{host} did not answer in {HOST_TIMEOUT}s")
-            else:
-                err = ("network", f"{host}: {_short(exc.reason)}")
-            continue
-        except socket.timeout:
-            _host_failed(host)
-            err = ("timeout", f"{host} stopped answering mid-response")
-            continue
-        except ValueError as exc:
-            err = ("http", f"{host}: unreadable response ({_short(exc)})")
-            continue
-        except OSError as exc:
-            _host_failed(host)
-            err = ("network", f"{host}: {_short(exc)}")
-            continue
-        chart = data.get("chart") or {}
-        result = (chart.get("result") or [None])[0]
-        if not result:
-            return None, ("symbol", (chart.get("error") or {}).get("description") or "symbol not found")
-        return result, None
-    return None, err or ("offline", f"every Yahoo host failed in the last {HOST_COOLDOWN}s")
-
-
-def fetch_symbol(sym, deadline):
-    hit = _cache_get(sym)
-    if hit is not None:
-        return hit
-    result, err = yahoo_chart(sym, "interval=1d&range=5d", deadline)
-    if err is None:
-        meta = result.get("meta", {})
-        price = meta.get("regularMarketPrice")
-        if price is None:
-            err = ("symbol", "no price in response")
-    if err:
-        out = {"error": err[1], "kind": err[0]}
-        if err[0] in ("symbol", "http"):
-            _cache_put(sym, out, ERROR_TTL)
-        return out
-
-    quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
-    closes = [c for c in (quotes.get("close") or []) if c is not None]
-    # Previous session close = second-to-last daily bar.
-    prev = closes[-2] if len(closes) >= 2 else (
-        meta.get("previousClose") or meta.get("chartPreviousClose")
-    )
-    out = {
-        "price": price,
-        "prev": prev,
-        "currency": meta.get("currency"),
-        "name": meta.get("shortName") or meta.get("longName"),
-        "exchange": meta.get("exchangeName"),
-        "time": meta.get("regularMarketTime"),
-    }
-    _cache_put(sym, out, CACHE_TTL)
-    return out
-
-
-def _log_batch(symbols, results, elapsed):
-    """One line per batch that failed or was slow, one when quotes recover, and
-    one per symbol whose own error (e.g. a delisted ticker) is new."""
-    failed = []
-    with _batch_lock:
-        seen = _batch_state["symbol_errors"]
-        for sym, r in zip(symbols, results):
-            kind = r.get("kind")
-            if kind == "symbol":
-                if seen.get(sym) != r["error"]:
-                    seen[sym] = r["error"]
-                    log_line(f"quote {sym}: {r['error']}")
-            else:
-                seen.pop(sym, None)
-                if kind:
-                    failed.append((sym, r))
-        was_failing = _batch_state["failing"]
-        _batch_state["failing"] = bool(failed)
-    if failed:
-        kinds = ", ".join(f"{k} {n}" for k, n in Counter(r["kind"] for _, r in failed).most_common())
-        sym, r = next(((s, r) for s, r in failed if r["kind"] not in ("offline", "deadline")), failed[0])
-        log_line(f"quotes: {len(failed)}/{len(symbols)} failed in {elapsed:.1f}s ({kinds}); e.g. {sym}: {r['error']}")
-    elif was_failing:
-        log_line(f"quotes: recovered, {len(symbols)} ok in {elapsed:.1f}s")
-    elif elapsed > SLOW_BATCH:
-        log_line(f"quotes: slow, {len(symbols)} ok in {elapsed:.1f}s")
-
-
-def fetch_many(symbols):
-    start = time.monotonic()
-    deadline = start + QUOTE_DEADLINE
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda sym: fetch_symbol(sym, deadline), symbols))
-    _log_batch(symbols, results, time.monotonic() - start)
-    return dict(zip(symbols, results))
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".json": "application/json; charset=utf-8",
+                ".webmanifest": "application/manifest+json", ".png": "image/png", ".ico": "image/x-icon", ".woff2": "font/woff2"}
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NetWorthPrices/1.0"
+    server_version = "Folio/2.0"
 
     def log_message(self, fmt, *args):
         pass  # keep the terminal quiet
@@ -391,107 +146,266 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if ctype.startswith("text/html"):  # everything the page loads comes from this server
+            self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         self.end_headers()
         self.wfile.write(body)
 
     def _json(self, code, payload, cors=True):
         self._send(code, json.dumps(payload).encode(), "application/json; charset=utf-8", cors)
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        if not self.path.startswith(("/api/data", "/api/history")):
-            self._cors()  # quotes are public data; holdings and history never get CORS headers
-        self.end_headers()
+    def _private(self):
+        """True when the caller may see private data; otherwise answers 403."""
+        if self._local_only_ok():
+            return True
+        self._json(403, {"error": "forbidden"}, cors=False)
+        return False
 
-    def do_PUT(self):
-        if urlparse(self.path).path != "/api/data":
-            return self._json(404, {"error": "not found"})
-        if not self._local_only_ok():
-            return self._json(403, {"error": "forbidden"}, cors=False)
+    def _body_json(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = 0
         if length <= 0 or length > MAX_BODY:
-            return self._json(413, {"error": "body missing or too large"}, cors=False)
+            self._json(413, {"error": "body missing or too large"}, cors=False)
+            return None
+        try:
+            return json.loads(self.rfile.read(length))
+        except ValueError as exc:
+            self._json(400, {"error": f"invalid JSON: {exc}"}, cors=False)
+            return None
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        if urlparse(self.path).path in ("/api/quotes", "/api/search", "/api/health"):
+            self._cors()  # public market data only; holdings and history never get CORS headers
+        self.end_headers()
+
+    # ---------- writes ----------
+    def do_PUT(self):
+        if urlparse(self.path).path != "/api/data":
+            return self._json(404, {"error": "not found"})
+        if not self._private():
+            return
         expected = self._if_match()
         if expected is None:
             return self._json(428, {"error": "If-Match revision required"}, cors=False)
+        obj = self._body_json()
+        if obj is None:
+            return
         try:
-            obj = json.loads(self.rfile.read(length))
             validate_portfolio(obj)
-        except ValueError as exc:
-            return self._json(400, {"error": f"invalid JSON: {exc}"}, cors=False)
-        try:
             rev = write_data(obj, expected)
+        except ValueError as exc:
+            return self._json(400, {"error": f"invalid data: {exc}"}, cors=False)
         except RevConflict as exc:
             return self._json(409, {"error": "conflict", "rev": exc.rev}, cors=False)
-        except ValueError as exc:
-            return self._json(500, {"error": f"could not read data file: {exc}"}, cors=False)
-        except OSError as exc:
-            return self._json(500, {"error": f"could not write data file: {exc}"}, cors=False)
+        except (OSError, StoreError) as exc:
+            return self._json(500, {"error": f"could not write data: {exc}"}, cors=False)
         if HISTORY:
             HISTORY.kick()
         self._json(200, {"ok": True, "rev": rev}, cors=False)
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in ("/api/history/rebuild", "/api/splits"):
+            return self._json(404, {"error": "not found"})
+        if not self._private():
+            return
+        body = self._body_json()
+        if body is None:
+            return
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "expected an object"}, cors=False)
+        if path == "/api/splits":
+            status = body.get("status")
+            if status not in ("applied", "dismissed") or not SYMBOL_RE.match(str(body.get("sym", ""))) \
+                    or not DATE_RE.match(str(body.get("date", ""))):
+                return self._json(400, {"error": "need sym, date and status applied|dismissed"}, cors=False)
+            ok = STORE.splits_set(body["sym"], body["date"], status)
+            return self._json(200 if ok else 404, {"ok": ok}, cors=False)
+        start = str(body.get("from", ""))
+        if not DATE_RE.match(start):
+            return self._json(400, {"error": "need from as YYYY-MM-DD"}, cors=False)
+        end = body.get("to")
+        if end is not None and not DATE_RE.match(str(end)):
+            return self._json(400, {"error": "to must be YYYY-MM-DD"}, cors=False)
+        try:
+            n = HISTORY.rebuild(start, end, bool(body.get("currentHoldings")))
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)}, cors=False)
+        self._json(200, {"ok": True, "days": n}, cors=False)
+
+    # ---------- reads ----------
     def do_GET(self):
         url = urlparse(self.path)
+        path = url.path
+        query = parse_qs(url.query)
 
-        if url.path == "/api/health":
+        if path == "/api/health":
             return self._json(200, {"ok": True})
 
-        if url.path == "/api/data":
-            if not self._local_only_ok():
-                return self._json(403, {"error": "forbidden"}, cors=False)
+        if path == "/api/data":
+            if not self._private():
+                return
             try:
                 data, rev = read_stored()
-            except (ValueError, OSError) as exc:
-                return self._json(500, {"error": f"could not read data file: {exc}"}, cors=False)
+            except (ValueError, OSError, StoreError) as exc:
+                return self._json(500, {"error": f"could not read data: {exc}"}, cors=False)
             return self._json(200, {"exists": data is not None, "data": data, "rev": rev}, cors=False)
 
-        if url.path == "/api/history":
-            if not self._local_only_ok():
-                return self._json(403, {"error": "forbidden"}, cors=False)
-            days = HISTORY.summary() if HISTORY else []
-            return self._json(200, {"days": days}, cors=False)
+        if path == "/api/history":
+            if not self._private():
+                return
+            return self._json(200, {"days": HISTORY.summary() if HISTORY else []}, cors=False)
 
-        if url.path == "/api/quotes":
-            raw = parse_qs(url.query).get("symbols", [""])[0]
+        if path == "/api/attribution":
+            if not self._private():
+                return
+            start, end = query.get("from", [""])[0], query.get("to", [""])[0]
+            if (start and not DATE_RE.match(start)) or (end and not DATE_RE.match(end)):
+                return self._json(400, {"error": "from and to must be YYYY-MM-DD"}, cors=False)
+            return self._json(200, HISTORY.attribution(start or None, end or None), cors=False)
+
+        if path == "/api/history/health":
+            if not self._private():
+                return
+            return self._json(200, HISTORY.health(), cors=False)
+
+        if path == "/api/status":
+            if not self._private():
+                return
+            return self._json(200, storage_status(), cors=False)
+
+        if path == "/api/splits":
+            if not self._private():
+                return
+            return self._json(200, {"splits": STORE.splits_list("pending")}, cors=False)
+
+        if path == "/api/search":
+            return self._json(200, {"results": QUOTES.search(query.get("q", [""])[0])})
+
+        if path == "/api/quotes":
             symbols = []
-            for s in raw.split(","):
+            for s in query.get("symbols", [""])[0].split(","):
                 s = s.strip()
                 if s and SYMBOL_RE.match(s) and s not in symbols:
                     symbols.append(s)
             symbols = symbols[:MAX_SYMBOLS]
             if not symbols:
                 return self._json(400, {"error": "Pass ?symbols=AAPL,RELIANCE.NS,USDINR=X"})
-            return self._json(200, {"quotes": fetch_many(symbols), "fetchedAt": int(time.time())})
+            return self._json(200, {"quotes": QUOTES.fetch_many(symbols), "fetchedAt": int(time.time())})
 
-        if url.path in ("/", "/index.html"):
-            try:
-                with open(os.path.join(HERE, "index.html"), "rb") as f:
-                    return self._send(200, f.read(), "text/html; charset=utf-8")
-            except FileNotFoundError:
-                return self._json(404, {"error": "index.html not found next to server.py"})
+        return self._static(path)
 
-        self._json(404, {"error": "not found"})
+    def _static(self, path):
+        if path in ("/", "/index.html"):
+            path = "/index.html"
+        rel = os.path.normpath(path.lstrip("/"))
+        full = os.path.realpath(os.path.join(WEB, rel))
+        if not full.startswith(os.path.realpath(WEB) + os.sep) or not os.path.isfile(full):
+            return self._json(404, {"error": "not found"})
+        ext = os.path.splitext(full)[1].lower()
+        ctype = STATIC_TYPES.get(ext)
+        if not ctype:
+            return self._json(404, {"error": "not found"})
+        with open(full, "rb") as f:
+            self._send(200, f.read(), ctype)
+
+
+def storage_status():
+    backups = []
+    try:
+        backups = sorted(n for n in os.listdir(STORE.backup_dir) if DAILY_BACKUP_RE.match(n))
+    except OSError:
+        pass
+    try:
+        size = os.path.getsize(STORE.path)
+    except OSError:
+        size = 0
+    return {"encrypted": STORE.encrypted(), "database": STORE.path, "bytes": size,
+            "lastBackup": backups[-1] if backups else None, "backups": len(backups),
+            "versions": len(STORE.versions()), "migrated": STORE.meta("imported_legacy") == "1"}
 
 
 def _portfolio_or_none():
     try:
         return read_stored()[0]
-    except (ValueError, OSError) as exc:
-        log_line(f"history: could not read {DATA_FILE}: {exc}")
+    except (ValueError, OSError, StoreError) as exc:
+        log_line(f"history: could not read the portfolio: {exc}")
         return None
+
+
+def _alpha_key_from_file():
+    """A key saved in alpha_vantage_api_key.txt next to server.py (or ALPHA_VANTAGE_KEY) works without pasting it into Settings."""
+    key = os.environ.get("ALPHA_VANTAGE_KEY", "").strip()
+    if key:
+        return key
+    try:
+        with open(os.path.join(HERE, "alpha_vantage_api_key.txt"), "r", encoding="utf-8") as f:
+            return f.read().strip().splitlines()[0].strip() if f.readable() else ""
+    except (OSError, IndexError):
+        return ""
+
+
+def _settings():
+    pf = _portfolio_or_none()
+    settings = dict((pf or {}).get("settings") or {})
+    if not str(settings.get("alphaKey") or "").strip():
+        settings["alphaKey"] = _alpha_key_from_file()
+    return settings
+
+
+def _warm_loop():
+    """Keep the last good prices recent, so a page load after a quiet stretch
+    (or while Yahoo is down) still has numbers to show."""
+    while True:
+        time.sleep(quotes_mod.WARM_EVERY)
+        try:
+            pf = _portfolio_or_none()
+            if pf is None:
+                continue
+            syms = sorted(history_mod.symbols_for(history_mod.strip_holdings(pf)))[:MAX_SYMBOLS]
+            QUOTES.fetch_many(syms)
+        except Exception as exc:
+            log_line(f"quotes: warm-up failed: {type(exc).__name__}: {exc}")
+
+
+def _check_latest_backup():
+    """Open the newest daily backup the way a restore would, and say so in the log."""
+    try:
+        names = sorted(n for n in os.listdir(STORE.backup_dir) if DAILY_BACKUP_RE.match(n))
+    except OSError:
+        return
+    if not names:
+        return
+    report = verify_db(os.path.join(STORE.backup_dir, names[-1]))
+    if report["ok"]:
+        log_line(f"backup check: {names[-1]} opens and decrypts ({report['holdings']} holdings, {report['history_days']} history days)")
+    else:
+        log_line(f"backup check: PROBLEM with {names[-1]}: {'; '.join(report['problems'])}")
+
+
+def open_store():
+    return open_default(DB_FILE, log=log_line)
 
 
 if __name__ == "__main__":
     setup_logging()
+    try:
+        STORE = open_store()
+    except StoreError as exc:
+        log_line(f"Cannot start: {exc}")
+        sys.exit(1)
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    log_line(f"Net worth tracker running at http://localhost:{PORT} (pid {os.getpid()}, Python {sys.version.split()[0]})")
-    log_line(f"Holdings: {DATA_FILE}  History: {HISTORY_FILE}  Log: {LOG_FILE}")
-    HISTORY = History(HISTORY_FILE, BACKUP_DIR, _portfolio_or_none, yahoo_chart, log_line)
+    log_line(f"Folio running at http://localhost:{PORT} (pid {os.getpid()}, Python {sys.version.split()[0]})")
+    log_line(f"Database: {STORE.path}{' (encrypted)' if STORE.encrypted() else ''}  Log: {LOG_FILE}")
+    QUOTES = Quotes(STORE, _settings, log_line)
+    HISTORY = History(STORE, _portfolio_or_none, quotes_mod.yahoo_chart, log_line)
     HISTORY.start()
+    threading.Thread(target=_warm_loop, name="warm", daemon=True).start()
+    threading.Thread(target=_check_latest_backup, name="backup-check", daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
