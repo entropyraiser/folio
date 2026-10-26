@@ -138,6 +138,17 @@ const step = async (name, fn) => { try { await fn(); results.push(['ok', name]);
       await b.click('[data-act=cancel]');
     });
 
+    await step('editing a cash balance saves and stamps its date', async () => {
+      await b.click('[data-act=tab][data-tab=cash]');
+      await wait(`document.querySelector('[data-act=edit][data-k=bank]')`);
+      await b.click('[data-act=edit][data-k=bank]');
+      await b.eval(`document.querySelector('#f-balance').value = '123456'`);
+      await b.click('#frm button[type=submit]');
+      const data = await saved(d => d.bank[0].balance === 123456);
+      assert.ok(data.bank[0].balanceAt > 0);
+      assert.equal(await b.eval(`document.querySelector('#dlg').open`), false);
+    });
+
     await step('overview rows drill into the matching page, filtered', async () => {
       await b.click('[data-act=tab][data-tab=overview]');
       await wait(`document.querySelector('.rank-row[data-act=focus]')`);

@@ -381,6 +381,7 @@ const FORMS = {
     { k: 'month', label: 'Month', type: 'month', req: 1 },
     { k: 'amount', label: 'Amount (INR)', type: 'number', req: 1 }] }
 };
+const CASH_KINDS = ['bcash', 'bank', 'hand'];
 const DEF = { bank: { currency: 'INR' }, bcash: { currency: 'USD' }, hand: { currency: 'INR' }, other: { currency: 'USD' }, in: { exchange: 'NSE' } };
 
 const norm = s => String(s || '').trim().toLowerCase();
