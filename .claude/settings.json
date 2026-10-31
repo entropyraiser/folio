@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(pkill:*)",
+      "Bash(killall:*)",
+      "Bash(xargs kill:*)",
+      "Edit(/folio.db*)",
+      "Edit(/data-backups/**)",
+      "Edit(/logs/**)",
+      "Edit(/alpha_vantage_api_key.txt)"
+    ]
+  }
+}
